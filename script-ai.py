@@ -1,145 +1,222 @@
+# Install necessary libraries if you haven't already:
+# pip install pandas nltk sentence-transformers scikit-learn
+
 import pandas as pd
-import google.generativeai as genai
-import matplotlib.pyplot as plt
-import time
-import os
-import seaborn as sns
-from fpdf import FPDF
+import nltk
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+import re
+from sentence_transformers import SentenceTransformer
+from sklearn.cluster import KMeans
+from sklearn.feature_extraction.text import TfidfVectorizer
+import numpy as np
 
-# Set your Google Gemini API key from environment variable
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise ValueError("❌ No se encontró la clave de API. Define GEMINI_API_KEY como variable de entorno.")
-genai.configure(api_key=GEMINI_API_KEY)
+# --- Configuration ---
+INPUT_CSV_PATH = 'Copy of Tracking de solicitudes (Responses) - Form Responses 1.csv' # Replace with your CSV file path
+OUTPUT_CSV_PATH = 'categorized_complaints.csv'
+TEXT_COLUMN = 'Comentarios' # Column containing the natural language comments
+MOTIVE_COLUMN = 'Motivo de su solicitud' # Existing categorization column
+N_CLUSTERS = 20  # Adjust based on your data and desired granularity. Experimentation is key!
+# Consider using the elbow method or silhouette analysis to find an optimal k.
 
-# Categories and subcategories
-categories = {
-    "Pagos": ["Cobro duplicado", "Tarjeta rechazada", "Comisión inesperada", "Otros problemas de pago"],
-    "Reembolso": ["Retraso de reembolso", "Reembolso no recibido", "Otros reembolsos"],
-    "Entradas": ["Transferencia de entradas", "Entrada no recibida", "Cantidad incorrecta", "Otros problemas de entradas"],
-    "Soporte Técnico": ["Problemas de acceso", "Fallo de plataforma", "Otros errores técnicos"],
-    "Solicitud de Información": ["Dónde comprar", "Precios y costos", "Horarios", "Otras consultas"],
-    "Error en la plataforma": ["Problemas con links de pago", "Problemas con tickets", "Otros errores"],
-    "Afiliación": ["Solicitud de afiliación", "Problemas con afiliación"],
-    "Otro": ["Sin clasificación específica"]
-}
+# --- Download NLTK resources (if not already downloaded) ---
+try:
+    stopwords.words('spanish')
+except LookupError:
+    nltk.download('stopwords')
+try:
+    word_tokenize("test")
+except LookupError:
+    nltk.download('punkt')
 
-main_labels = list(categories.keys())
+# --- Helper Functions ---
 
-def gemini_classify(comment): # Renamed function
-    # Choose a Gemini model
-    # For text generation tasks like classification, 'gemini-1.5-flash-latest' is a good balance of capability and speed.
-    # You can also use 'gemini-pro'.
-    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+def preprocess_text(text, language='spanish'):
+    """
+    Cleans and preprocesses a single text string.
+    - Converts to lowercase
+    - Removes punctuation and numbers
+    - Removes stop words
+    - Tokenizes
+    """
+    if pd.isna(text) or not isinstance(text, str):
+        return "" # Return empty string for NaN or non-string inputs
+    
+    text = text.lower()
+    text = re.sub(r'[^\w\s]', '', text) # Remove punctuation
+    text = re.sub(r'\d+', '', text)     # Remove numbers
+    
+    tokens = word_tokenize(text, language=language)
+    
+    stop_words_list = stopwords.words(language)
+    # Add any custom stop words relevant to your domain
+    # custom_stop_words = ['n1co', 'app', 'cliente', 'favor'] 
+    # stop_words_list.extend(custom_stop_words)
+    
+    processed_tokens = [word for word in tokens if word not in stop_words_list and len(word) > 1]
+    
+    return " ".join(processed_tokens)
 
-    prompt_parts = [
-        "Eres un asistente que clasifica quejas de clientes en categorías y subcategorías bien definidas.",
-        "Las categorías principales son: " + ", ".join(main_labels) + ".",
-        "Cada categoría tiene estas subcategorías:",
-        "\n".join([f"{cat}: {', '.join(subs)}" for cat, subs in categories.items()]),
-        "\nPara el siguiente comentario, responde SOLO con el nombre de la categoría principal y la subcategoría más adecuada, separados por coma. Ejemplo: Pagos, Cobro duplicado",
-        f"\nComentario: {comment}",
-        "Categoría, Subcategoría:"
-    ]
+def generate_embeddings(texts, model_name='paraphrase-multilingual-MiniLM-L12-v2'):
+    """
+    Generates sentence embeddings for a list of texts.
+    Uses a multilingual model suitable for Spanish text.
+    """
+    print(f"Loading sentence transformer model: {model_name}...")
+    # This model is good for multilingual text, including Spanish.
+    model = SentenceTransformer(model_name)
+    print("Model loaded. Generating embeddings (this may take some time)...")
+    embeddings = model.encode(texts, show_progress_bar=True)
+    print("Embeddings generated.")
+    return embeddings
 
+def perform_clustering(embeddings, n_clusters):
+    """
+    Performs K-Means clustering on the embeddings.
+    """
+    print(f"Performing K-Means clustering with {n_clusters} clusters...")
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+    cluster_labels = kmeans.fit_predict(embeddings)
+    print("Clustering complete.")
+    return cluster_labels
+
+def get_top_keywords_per_cluster(texts, cluster_labels, n_clusters, n_keywords=5, language='spanish'):
+    """
+    Extracts top TF-IDF keywords for each cluster.
+    """
+    print("Extracting top keywords for each cluster...")
+    df_clusters = pd.DataFrame({'text': texts, 'cluster': cluster_labels})
+    cluster_keywords = {}
+    
+    stop_words_list = stopwords.words(language)
+
+    for i in range(n_clusters):
+        cluster_texts = df_clusters[df_clusters['cluster'] == i]['text'].tolist()
+        if not cluster_texts: # Handle empty clusters
+            cluster_keywords[i] = ["N/A - Empty Cluster"]
+            continue
+        
+        try:
+            vectorizer = TfidfVectorizer(max_features=n_keywords * 2, # Get more to choose from
+                                         stop_words=stop_words_list,
+                                         ngram_range=(1,2)) # Consider unigrams and bigrams
+            tfidf_matrix = vectorizer.fit_transform(cluster_texts)
+            feature_names = vectorizer.get_feature_names_out()
+            
+            # Sum TF-IDF scores for each term across the cluster
+            sum_tfidf = tfidf_matrix.sum(axis=0)
+            # Get indices of top N keywords
+            top_n_indices = np.argsort(sum_tfidf)[0, ::-1][0, :n_keywords].A1 # Squeeze to 1D array
+            
+            top_keywords = [feature_names[idx] for idx in top_n_indices]
+            cluster_keywords[i] = top_keywords if top_keywords else ["N/A - No distinct keywords"]
+
+        except ValueError as e:
+            # This can happen if all documents in a cluster are empty after preprocessing
+            # or if they only contain stop words.
+            print(f"Warning: Could not extract keywords for cluster {i}: {e}")
+            cluster_keywords[i] = ["N/A - Keyword extraction error"]
+            
+    print("Keyword extraction complete.")
+    return cluster_keywords
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    print("Starting complaint categorization process...")
+
+    # 1. Load Data
     try:
-        # Configuration for deterministic output and limiting token usage
-        generation_config = genai.types.GenerationConfig(
-            temperature=0,
-            max_output_tokens=60 # Increased to allow for longer category/subcategory names
-        )
-        response = model.generate_content(prompt_parts, generation_config=generation_config)
-        text = response.text.strip()
-        parts = [x.strip() for x in text.split(",")]
-        if len(parts) == 2:
-            # Validate if the returned category and subcategory are known, otherwise default to "Otro"
-            main_cat_candidate = parts[0]
-            sub_cat_candidate = parts[1]
-            if main_cat_candidate in categories and sub_cat_candidate in categories.get(main_cat_candidate, []):
-                return pd.Series([main_cat_candidate, sub_cat_candidate])
-            else:
-                # If Gemini hallucinates a category/subcategory not in our list, try to find best main category
-                # and default subcategory, or just default to "Otro"
-                if main_cat_candidate in categories:
-                     return pd.Series([main_cat_candidate, categories[main_cat_candidate][0] if categories[main_cat_candidate] else "Sin clasificación específica"])
-                return pd.Series(["Otro", "Sin clasificación específica"])
-        else:
-            return pd.Series(["Otro", "Sin clasificación específica"])
+        df = pd.read_csv(INPUT_CSV_PATH)
+        print(f"Successfully loaded {INPUT_CSV_PATH}. Shape: {df.shape}")
+    except FileNotFoundError:
+        print(f"Error: Input CSV file not found at {INPUT_CSV_PATH}")
+        exit()
     except Exception as e:
-        print(f"Error during Gemini API call for comment '{comment[:50]}...': {e}")
-        # Check for specific API errors if needed, e.g., rate limits
-        # if "rate limit" in str(e).lower():
-        #     print("Rate limit likely exceeded. Consider increasing sleep time or checking quotas.")
-        return pd.Series(["Otro", "Sin clasificación específica"])
+        print(f"Error loading CSV: {e}")
+        exit()
 
-# Load data
-df = pd.read_csv("/Users/johepgradis/Downloads/DATA-360/Tracking de solicitudes (Responses) - Form Responses 1.csv", encoding='utf-8', engine='python')
-df = df[df['Comentarios'].notna()].copy()
+    # Ensure the text column exists
+    if TEXT_COLUMN not in df.columns:
+        print(f"Error: Text column '{TEXT_COLUMN}' not found in the CSV.")
+        print(f"Available columns: {df.columns.tolist()}")
+        exit()
 
-# Filter for 2024 and later (if you added this previously)
-df['Marca temporal'] = pd.to_datetime(df['Marca temporal'], errors='coerce', dayfirst=False)
-df = df[df['Marca temporal'].dt.year >= 2024]
+    # Handle missing values in the text column before preprocessing
+    df[TEXT_COLUMN] = df[TEXT_COLUMN].fillna('') 
+
+    # 2. Preprocess Text
+    print(f"Preprocessing text in column: '{TEXT_COLUMN}'...")
+    # Create a new column for processed text to keep the original
+    df['processed_comentarios'] = df[TEXT_COLUMN].apply(lambda x: preprocess_text(x, language='spanish'))
+    print("Text preprocessing complete.")
+    print(f"Sample of processed comments:\n{df[['processed_comentarios', TEXT_COLUMN]].head()}")
+
+    # Filter out rows where processed_comentarios is empty, as they cannot be embedded meaningfully
+    # Or, decide on a strategy for them (e.g., assign to a special cluster)
+    # For now, we'll proceed with non-empty ones for embedding.
+    # If many are empty, it might indicate an issue with preprocessing or original data.
+    non_empty_texts_df = df[df['processed_comentarios'].str.strip() != '']
+    if non_empty_texts_df.empty:
+        print("Error: All comments are empty after preprocessing. Cannot proceed with embedding.")
+        exit()
+    
+    original_indices = non_empty_texts_df.index # Keep track of original indices
+
+    # 3. Generate Embeddings
+    # Only generate embeddings for non-empty processed texts
+    texts_for_embedding = non_empty_texts_df['processed_comentarios'].tolist()
+    embeddings = generate_embeddings(texts_for_embedding)
+
+    # 4. Perform Clustering
+    # Ensure N_CLUSTERS is not greater than the number of samples
+    actual_n_clusters = min(N_CLUSTERS, len(texts_for_embedding))
+    if actual_n_clusters < N_CLUSTERS:
+        print(f"Warning: N_CLUSTERS ({N_CLUSTERS}) was greater than the number of non-empty samples ({len(texts_for_embedding)}). Adjusting to {actual_n_clusters}.")
+    if actual_n_clusters < 2: # K-Means needs at least 2 clusters (or 1 if only 1 sample)
+        print("Error: Not enough unique samples to perform clustering. Need at least 2.")
+        # Potentially save the preprocessed data and exit
+        df.to_csv(OUTPUT_CSV_PATH, index=False, encoding='utf-8-sig')
+        print(f"Preprocessed data (without clustering) saved to {OUTPUT_CSV_PATH}")
+        exit()
+        
+    cluster_labels = perform_clustering(embeddings, actual_n_clusters)
+    
+    # Add cluster labels back to the non_empty_texts_df
+    non_empty_texts_df['nlp_cluster'] = cluster_labels
+    
+    # Merge cluster labels back into the original DataFrame
+    df['nlp_cluster'] = np.nan # Initialize with NaN
+    df.loc[original_indices, 'nlp_cluster'] = non_empty_texts_df['nlp_cluster']
+    # Convert to integer type if no NaNs, otherwise keep as float
+    if df['nlp_cluster'].notna().all():
+        df['nlp_cluster'] = df['nlp_cluster'].astype(int)
 
 
-# Apply Gemini classification (with delay to be mindful of API quotas)
-results = []
-print(f"Starting classification for {len(df)} comments using Gemini API...")
-for i, comment in enumerate(df['Comentarios']):
-    if i > 0 and i % 50 == 0: # Print progress every 50 comments
-        print(f"Processed {i}/{len(df)} comments...")
-    results.append(gemini_classify(comment))
-    time.sleep(1)  # Adjust based on Gemini API rate limits (e.g., gemini-1.5-flash default is 60 QPM)
+    # 5. Get Top Keywords
+    # Use texts_for_embedding and cluster_labels which correspond to each other
+    cluster_keywords_map = get_top_keywords_per_cluster(texts_for_embedding, cluster_labels, actual_n_clusters, language='spanish')
+    
+    # Map keywords to the original DataFrame
+    df['nlp_cluster_keywords'] = df['nlp_cluster'].map(cluster_keywords_map).fillna("N/A - Original comment was empty or not clustered")
+    # Ensure keywords are stored as strings (e.g., comma-separated)
+    df['nlp_cluster_keywords'] = df['nlp_cluster_keywords'].apply(lambda x: ', '.join(x) if isinstance(x, list) else x)
 
-df[['Categoría', 'Subcategoría']] = results
-print("Classification complete.")
 
-# Generar resumen por categoría y subcategoría
-resumen = df.groupby(['Categoría', 'Subcategoría']).size().reset_index(name='Cantidad')
-resumen = resumen.sort_values(['Categoría', 'Cantidad'], ascending=[True, False])
-resumen.to_excel("resumen_categorias_gemini.xlsx", index=False)
-print("📊 Resumen exportado como resumen_categorias_gemini.xlsx")
+    # 6. Save Results
+    try:
+        df.to_csv(OUTPUT_CSV_PATH, index=False, encoding='utf-8-sig') # utf-8-sig for better Excel compatibility with special chars
+        print(f"Categorization complete. Results saved to {OUTPUT_CSV_PATH}")
+    except Exception as e:
+        print(f"Error saving results to CSV: {e}")
 
-# Visualization with Seaborn
-plt.figure(figsize=(10, 6))
-sns.countplot(y='Categoría', data=df, order=df['Categoría'].value_counts().index, palette='Set2')
-plt.title('Distribución de Categorías de Quejas (Gemini)')
-plt.xlabel('Cantidad')
-plt.ylabel('Categoría')
-plt.tight_layout()
-plt.savefig("distribucion_categorias_gemini.png")
-plt.show()
-
-# Crear reporte en PDF
-pdf = FPDF()
-pdf.add_page()
-pdf.set_font("Arial", size=12)
-pdf.cell(200, 10, txt="Reporte de Clasificación de Quejas (Gemini)", ln=True, align='C')
-pdf.ln(10)
-pdf.image("distribucion_categorias_gemini.png", x=10, y=30, w=180)
-pdf.ln(105)
-
-pdf.set_font("Arial", 'B', 12)
-pdf.cell(200, 10, txt="Resumen de Subcategorías", ln=True)
-pdf.set_font("Arial", 'B', 10)
-pdf.cell(60, 8, "Categoría", 1)
-pdf.cell(80, 8, "Subcategoría", 1)
-pdf.cell(30, 8, "Cantidad", 1)
-pdf.ln()
-pdf.set_font("Arial", size=10)
-
-top_subcats = resumen.head(10)
-for _, row in top_subcats.iterrows():
-    pdf.cell(60, 8, str(row['Categoría']), 1)
-    pdf.cell(80, 8, str(row['Subcategoría']), 1)
-    pdf.cell(30, 8, str(row['Cantidad']), 1)
-    pdf.ln()
-
-pdf.ln(10)
-pdf.set_font("Arial", 'B', 12)
-pdf.cell(200, 10, txt="Comentarios del Análisis:", ln=True)
-pdf.set_font("Arial", size=10)
-comentario = f"La mayoría de las quejas registradas pertenecen a la categoría '{df['Categoría'].value_counts().idxmax()}', siendo la subcategoría más frecuente '{df['Subcategoría'].value_counts().idxmax()}'. Se recomienda enfocar esfuerzos en resolver esta problemática primero."
-pdf.multi_cell(0, 8, comentario)
-
-pdf.output("reporte_quejas_gemini.pdf")
-print("📝 Reporte PDF generado como reporte_quejas_gemini.pdf")
+    print("\n--- Process Summary ---")
+    print(f"Total rows processed: {len(df)}")
+    print(f"Rows with non-empty comments used for clustering: {len(non_empty_texts_df)}")
+    print(f"Number of clusters generated: {actual_n_clusters}")
+    print(f"Output file: {OUTPUT_CSV_PATH}")
+    print("\n--- Next Steps ---")
+    print(f"1. Review '{OUTPUT_CSV_PATH}'.")
+    print("2. Analyze the 'nlp_cluster' and 'nlp_cluster_keywords' columns.")
+    print("3. Manually inspect comments within each cluster to assign meaningful, human-readable category names.")
+    print("4. Experiment with 'N_CLUSTERS' and preprocessing steps to refine categories.")
+    print("5. Consider using techniques like the elbow method or silhouette score to help determine an optimal number of clusters.")
