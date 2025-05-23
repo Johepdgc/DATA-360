@@ -10,7 +10,7 @@ from openai import OpenAI
 import os
 
 # 1. Load data
-df = pd.read_csv("/Users/johepgradis/Downloads/DATA-360/Tracking de solicitudes (Responses) - Form Responses 1.csv", encoding='utf-8', engine='python')
+df = pd.read_csv("Tracking de solicitudes (Responses) - Form Responses 1.csv", encoding='utf-8', engine='python')
 df = df[df['Comentarios'].notna()].copy()
 
 # Embeddings y agrupamiento de comentarios
